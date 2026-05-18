@@ -74,41 +74,52 @@ def load_video_clip(
     return np.stack(frames, axis=0)   # (T, H, W, 3)
 
 
+# Pre-computed ImageNet normalisation constants (on CPU, broadcast-ready)
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+_IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+
+def _pil_to_float_tensor(img) -> torch.Tensor:
+    """
+    Convert a PIL RGB image to a (C, H, W) float32 tensor WITHOUT numpy.
+
+    PyTorch 2.2 + NumPy 2.x are binary-incompatible: torch.from_numpy()
+    and torch.tensor(np_array) both fail at runtime.  This function avoids
+    numpy entirely by reading raw bytes from PIL and using torch.frombuffer()
+    which operates on Python's buffer protocol (no numpy C API required).
+    """
+    W, H = img.size
+    raw = img.convert("RGB").tobytes()                   # (H*W*3,) bytes
+    t = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    return t.view(H, W, 3).permute(2, 0, 1).float() / 255.0  # (C, H, W)
+
+
 def frames_to_tensor(frames: np.ndarray, transform=None) -> torch.Tensor:
     """
-    Convert (T, H, W, 3) uint8 numpy array to a model-ready tensor.
+    Convert (T, H, W, 3) uint8 numpy array to a model-ready (C, T, H, W) tensor.
 
-    Two layout conventions exist in the video deep-learning world:
-      - (C, T, H, W): used by C3D, X3D, Video Swin
-      - (T, C, H, W): used by some transformer implementations
-
-    This function produces (C, T, H, W) by default (most common for 3D-CNNs).
-    The transform is applied per-frame before stacking.
+    The transform (PIL-only, no ToTensor) is applied per-frame.
+    Tensor conversion and normalisation use torch.frombuffer() to avoid
+    the PyTorch 2.2 + NumPy 2.x binary incompatibility.
 
     Args:
-        frames:    (T, H, W, 3) uint8 numpy array.
-        transform: Optional torchvision transform applied to each frame PIL image.
+        frames:    (T, H, W, 3) uint8 numpy array (RGB, from OpenCV BGR→RGB).
+        transform: PIL-only torchvision transform (Resize/Flip/Jitter/Rotation).
+                   Must NOT include ToTensor or Normalize.
 
     Returns:
         Tensor of shape (C, T, H, W), float32, ImageNet-normalised.
     """
     from PIL import Image
-
-    if transform is not None:
-        # Apply spatial augmentation frame-by-frame (keeps temporal coherence)
-        tensors = []
-        for t in range(frames.shape[0]):
-            img = Image.fromarray(frames[t])
-            tensors.append(transform(img))               # (C, H, W)
-        clip = torch.stack(tensors, dim=1)               # (C, T, H, W)
-    else:
-        # Fast path: manual normalisation without per-frame PIL overhead
-        clip = torch.from_numpy(frames).permute(3, 0, 1, 2).float() / 255.0
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1, 1)
-        std  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1, 1)
-        clip = (clip - mean) / std
-
-    return clip   # (C, T, H, W)
+    tensors = []
+    for t in range(frames.shape[0]):
+        img = Image.fromarray(frames[t])                 # uint8 RGB PIL image
+        if transform is not None:
+            img = transform(img)                         # PIL → PIL
+        tensor = _pil_to_float_tensor(img)               # PIL → (C, H, W) float
+        tensor = (tensor - _IMAGENET_MEAN) / _IMAGENET_STD
+        tensors.append(tensor)
+    return torch.stack(tensors, dim=1)                   # (C, T, H, W)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,6 +140,10 @@ def get_frame_transform(split: str = "train", img_size: int = 224) -> transforms
     Returns:
         torchvision.transforms.Compose
     """
+    # NOTE: ToTensor and Normalize are intentionally excluded here.
+    # frames_to_tensor() handles PIL→tensor conversion and normalization
+    # using torch.frombuffer() to avoid the PyTorch 2.2 + NumPy 2.x
+    # binary incompatibility where torch.from_numpy() raises RuntimeError.
     if split == "train":
         return transforms.Compose([
             transforms.Resize((img_size, img_size)),
@@ -136,16 +151,10 @@ def get_frame_transform(split: str = "train", img_size: int = 224) -> transforms
             transforms.ColorJitter(brightness=0.3, contrast=0.3,
                                    saturation=0.3, hue=0.0),
             transforms.RandomRotation(degrees=10),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
         ])
     else:
         return transforms.Compose([
             transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
         ])
 
 
