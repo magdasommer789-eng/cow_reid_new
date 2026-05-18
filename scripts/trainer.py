@@ -184,7 +184,7 @@ class ReIDTrainer:
         return DataLoader(
             self.train_dataset,
             batch_sampler = batch_sampler,
-            num_workers   = 0  # numpy 2.x incompatibility with worker subprocesses,
+            num_workers   = 0,  # numpy 2.x: num_workers>0 breaks in worker subprocesses
             pin_memory    = (self.device == "cuda"),
         )
 
