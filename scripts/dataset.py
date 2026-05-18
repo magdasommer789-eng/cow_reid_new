@@ -134,7 +134,7 @@ def get_frame_transform(split: str = "train", img_size: int = 224) -> transforms
             transforms.Resize((img_size, img_size)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.3, contrast=0.3,
-                                   saturation=0.3, hue=0.1),
+                                   saturation=0.3, hue=0.0),
             transforms.RandomRotation(degrees=10),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
