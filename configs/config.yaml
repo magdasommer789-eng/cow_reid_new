@@ -10,7 +10,7 @@
 
 # ==================== DATA CONFIGURATION ====================
 data:
-  video_dir: "/data"               # Root directory containing cow videos
+  video_dir: "/home/hswts124607/cow_videos"               # Root directory containing cow videos
   processed_dir: "./data/processed"  # Where extracted clips/metadata are saved
 
   # Train/Test split — split by cow identity (open-set re-ID)
