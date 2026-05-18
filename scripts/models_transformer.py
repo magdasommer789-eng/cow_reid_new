@@ -291,21 +291,30 @@ class ViViTEmbeddingModel(nn.Module):
                 )
 
     def _resize_pos_embed(self, num_tokens: int, embed_dim: int):
-        """Interpolate ViT's positional embedding to match num_tokens."""
-        with torch.no_grad():
-            old_pos_emb = self.vit.pos_embed                    # (1, 197, D)
-            cls_emb     = old_pos_emb[:, :1, :]                 # (1, 1, D)
-            spatial_emb = old_pos_emb[:, 1:, :]                 # (1, 196, D)
+        """
+        Expand ViT positional embeddings from 197 (1+196) to 1+T*196 tokens.
 
-            # Bicubic interpolation in 2D, then expand for new token count
-            spatial_emb = spatial_emb.reshape(1, 14, 14, embed_dim).permute(0, 3, 1, 2)
-            new_size = int(num_tokens ** 0.5)
-            spatial_emb = F.interpolate(
-                spatial_emb, size=(new_size, new_size),
-                mode="bicubic", align_corners=False,
-            )
-            spatial_emb = spatial_emb.permute(0, 2, 3, 1).reshape(1, -1, embed_dim)
-            new_pos_emb = torch.cat([cls_emb, spatial_emb], dim=1)
+        Strategy (ViViT standard): tile the original 196 spatial position
+        embeddings across T temporal steps.  Each time step shares the same
+        spatial positional bias — learned temporal context comes from
+        attention across token positions.
+
+        Args:
+            num_tokens: T * num_spatial_patches (e.g. 8 * 196 = 1568).
+            embed_dim:  Embedding dimension D (768 for ViT-B).
+        """
+        with torch.no_grad():
+            old_pos_emb = self.vit.pos_embed        # (1, 197, D)
+            cls_emb     = old_pos_emb[:, :1, :]    # (1, 1,   D)
+            spatial_emb = old_pos_emb[:, 1:, :]    # (1, 196, D)
+
+            num_spatial = spatial_emb.shape[1]      # 196
+            num_time    = num_tokens // num_spatial  # T = 8
+
+            # Tile spatial pos_emb T times: (1, T*196, D)
+            tiled = spatial_emb.repeat(1, num_time, 1)
+
+            new_pos_emb = torch.cat([cls_emb, tiled], dim=1)   # (1, 1+T*196, D)
             self.vit.pos_embed = nn.Parameter(new_pos_emb)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

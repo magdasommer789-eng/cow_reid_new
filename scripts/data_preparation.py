@@ -34,7 +34,7 @@ from typing import Dict, List, Tuple
 # Video discovery
 # ─────────────────────────────────────────────────────────────────────────────
 
-VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".MOV"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".MP4", ".AVI", ".MOV", ".MKV"}
 
 
 def discover_videos(video_dir: str) -> Dict[str, str]:
@@ -57,7 +57,7 @@ def discover_videos(video_dir: str) -> Dict[str, str]:
 
     cow_videos: Dict[str, str] = {}
     for path in sorted(video_dir.iterdir()):
-        if path.suffix in VIDEO_EXTENSIONS:
+        if path.suffix.lower() in {e.lower() for e in VIDEO_EXTENSIONS}:
             cow_id = path.stem          # filename without extension = cow ID
             cow_videos[cow_id] = str(path.resolve())
 
