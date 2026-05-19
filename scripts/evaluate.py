@@ -87,7 +87,10 @@ def extract_embeddings(
     for clips, cow_ids, roles in tqdm(loader, desc="Extracting embeddings"):
         clips = clips.to(device, non_blocking=True)
         embs  = model(clips)                                     # (B, D)
-        all_embeddings.append(embs.cpu().numpy())
+        # tensor.numpy() fails with PyTorch 2.2 + NumPy 2.x (binary incompatible).
+        # tolist() → np.array() copies via pure Python, bypassing the C API bridge.
+        import numpy as _np
+        all_embeddings.append(_np.array(embs.cpu().float().tolist(), dtype=_np.float32))
         all_cow_ids.extend(list(cow_ids))
         all_roles.extend(list(roles))
 
