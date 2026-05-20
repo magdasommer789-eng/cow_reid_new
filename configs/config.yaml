@@ -82,7 +82,7 @@ model:
 # ==================== TRAINING CONFIGURATION ====================
 training:
   batch_size: 8                    # Lower than image models due to video memory cost
-  num_epochs: 20
+  num_epochs: 8
   learning_rate: 0.0001
   weight_decay: 0.0001
 
@@ -100,7 +100,7 @@ training:
   P: 4                             # Number of identities per batch
   K: 2                             # Number of clips per identity (batch_size = P*K)
 
-  early_stopping_patience: 8
+  early_stopping_patience: 3
   device: "cuda"
 
 # ==================== AUGMENTATION CONFIGURATION ====================
