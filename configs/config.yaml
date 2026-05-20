@@ -128,7 +128,7 @@ logging:
   log_dir: "./logs"
   checkpoint_dir: "./checkpoints"
   results_dir: "./results"
-  save_interval: 5                 # Save checkpoint every N epochs
+  save_interval: 999                 # Save checkpoint every N epochs
   use_tensorboard: true
   use_wandb: false
 
