@@ -1,447 +1,352 @@
 """
-Data Preparation for Video-Based Cow Re-Identification
-=======================================================
+Data Preparation v2 — Video-Based Cow Re-Identification
+=========================================================
 
-This script handles all preprocessing before training:
+Pipeline:
+  1. Check free disk space on /local1 before writing anything.
+  2. Discover all 31 cow videos in cow_videos/.
+  3. Deterministic 3-way split: 15 train / 6 val / 10 test (seeded by identity).
+  4. Extract non-overlapping 10-second MP4 clips via ffmpeg:
+       /local1/cow_clips/{split}/{cow_id}/{cow_id}_{N:03d}.mp4
+  5. For val and test cows the first clip (N=001) is the *query*;
+     all remaining clips are *gallery*.  Train clips have role="train".
+  6. Save a flat metadata JSON: data/processed/dataset_metadata.json.
 
-1. Discovers all cow videos in /data (one video = one cow identity)
-2. Splits cows into train (21) and test (10) sets — split by identity,
-   so the model never sees test cow identities during training.
-3. For test cows, creates a strict gallery/query split:
-   - Gallery: first 10 seconds (used as the "known" reference)
-   - Query:   everything after 10 seconds (used to search against gallery)
-4. Saves a metadata JSON that the dataset loader reads at runtime.
-
-Educational Note:
-  Open-set Re-ID vs. Closed-set Re-ID
-  ------------------------------------
-  Closed-set: all identities are known at training time (classification works).
-  Open-set:   test identities are UNSEEN during training → we need embeddings.
-  This project is open-set: train and test cow IDs never overlap.
+Usage:
+  python -m scripts.data_preparation
+  python -m scripts.data_preparation --video_dir /path/to/videos
 """
 
-import os
-import json
-import random
 import argparse
-import cv2
-import numpy as np
+import json
+import os
+import random
+import shutil
+import subprocess
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+
+
+def _get_ffmpeg() -> str:
+    """Return path to ffmpeg binary (system or bundled via imageio-ffmpeg)."""
+    import shutil as _shutil
+    system_ff = _shutil.which("ffmpeg")
+    if system_ff:
+        return system_ff
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except ImportError:
+        raise RuntimeError(
+            "ffmpeg not found. Install it (apt install ffmpeg) or "
+            "pip install imageio-ffmpeg."
+        )
+
+
+FFMPEG = _get_ffmpeg()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Safety: disk-space guard
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_disk_space(path: str, min_gb: float = 5.0) -> None:
+    """Raise RuntimeError if free space at *path* is below *min_gb* GB."""
+    stat = shutil.disk_usage(path)
+    free_gb  = stat.free  / (1024 ** 3)
+    total_gb = stat.total / (1024 ** 3)
+    print(f"  Disk [{path}]: {free_gb:.1f} GB free / {total_gb:.1f} GB total")
+    if free_gb < min_gb:
+        raise RuntimeError(
+            f"Disk space too low at {path}: {free_gb:.1f} GB free "
+            f"(need ≥ {min_gb:.1f} GB). Aborting to prevent system crash."
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Video discovery
 # ─────────────────────────────────────────────────────────────────────────────
 
-VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".MP4", ".AVI", ".MOV", ".MKV"}
+_VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".MP4", ".AVI", ".MOV", ".MKV"}
 
 
 def discover_videos(video_dir: str) -> Dict[str, str]:
-    """
-    Scan video_dir and return a mapping {cow_id: video_path}.
-
-    The cow identity is derived from the video filename (without extension),
-    matching the project convention: "The id of the cow is always the name
-    of the video."
-
-    Args:
-        video_dir: Directory containing one video file per cow.
-
-    Returns:
-        Dictionary mapping cow_id (str) → absolute video path (str).
-    """
-    video_dir = Path(video_dir)
-    if not video_dir.exists():
-        raise FileNotFoundError(f"Video directory not found: {video_dir}")
-
-    cow_videos: Dict[str, str] = {}
-    for path in sorted(video_dir.iterdir()):
-        if path.suffix.lower() in {e.lower() for e in VIDEO_EXTENSIONS}:
-            cow_id = path.stem          # filename without extension = cow ID
-            cow_videos[cow_id] = str(path.resolve())
-
-    print(f"Found {len(cow_videos)} cow videos in {video_dir}")
-    return cow_videos
+    """Return {cow_id: absolute_path} for every video in *video_dir*."""
+    p = Path(video_dir)
+    if not p.exists():
+        raise FileNotFoundError(f"Video directory not found: {p}")
+    result = {}
+    for f in sorted(p.iterdir()):
+        if f.suffix in _VIDEO_EXTS:
+            result[f.stem] = str(f.resolve())
+    print(f"Found {len(result)} cow videos in {p}")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Train / Test split (by identity)
+# 3-way split
 # ─────────────────────────────────────────────────────────────────────────────
 
 def split_cows(
-    cow_ids: List[str],
-    num_train: int = 21,
-    seed: int = 42
-) -> Tuple[List[str], List[str]]:
+    cow_ids:       List[str],
+    num_train:     int,
+    num_val:       int,
+    seed:          int = 42,
+) -> Tuple[List[str], List[str], List[str]]:
     """
-    Randomly partition cow identities into train and test sets.
+    Randomly partition cow IDs into train / val / test (test = remainder).
 
-    The split is deterministic (seeded) so experiments are reproducible.
-    Train and test cow IDs are DISJOINT — this is the core open-set property.
-
-    Args:
-        cow_ids:   Sorted list of all cow identity strings.
-        num_train: How many cows go into the training set (default 21).
-        seed:      Random seed for reproducibility.
-
-    Returns:
-        (train_ids, test_ids) — two disjoint lists of cow identity strings.
+    Sorting before shuffle ensures the split is deterministic across platforms.
     """
-    if len(cow_ids) < num_train:
-        raise ValueError(
-            f"Not enough cows ({len(cow_ids)}) for {num_train} train identities."
-        )
-
-    ids = sorted(cow_ids)           # Sort first so the seed is truly deterministic
+    ids = sorted(cow_ids)
     rng = random.Random(seed)
     rng.shuffle(ids)
 
     train_ids = sorted(ids[:num_train])
-    test_ids  = sorted(ids[num_train:])
+    val_ids   = sorted(ids[num_train : num_train + num_val])
+    test_ids  = sorted(ids[num_train + num_val :])
 
-    print(f"Train cows ({len(train_ids)}): {train_ids}")
-    print(f"Test  cows ({len(test_ids)}):  {test_ids}")
-    return train_ids, test_ids
+    print(f"\nSplit (seed={seed}):")
+    print(f"  Train ({len(train_ids):2d}): {train_ids}")
+    print(f"  Val   ({len(val_ids):2d}):   {val_ids}")
+    print(f"  Test  ({len(test_ids):2d}):  {test_ids}")
+    return train_ids, val_ids, test_ids
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Video metadata helpers
+# Video metadata
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_video_metadata(video_path: str) -> Dict:
-    """
-    Read basic metadata (fps, total frames, duration) from a video file.
-
-    Args:
-        video_path: Path to the video file.
-
-    Returns:
-        Dict with keys: fps, total_frames, duration_seconds.
-    """
+def get_video_duration(video_path: str) -> Tuple[float, float]:
+    """Return (fps, duration_seconds) using OpenCV."""
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        raise IOError(f"Cannot open video: {video_path}")
-
-    fps           = cap.get(cv2.CAP_PROP_FPS)
-    total_frames  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration      = total_frames / fps if fps > 0 else 0.0
+    fps    = cap.get(cv2.CAP_PROP_FPS)
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
-
-    return {
-        "fps":              fps,
-        "total_frames":     total_frames,
-        "duration_seconds": duration,
-    }
+    duration = frames / fps if fps > 0 else 0.0
+    return fps, duration
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Clip index generation
+# Clip extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_clip_indices(
-    start_frame: int,
-    end_frame: int,
-    clip_frames: int,
-    clip_stride: int,
-) -> List[Tuple[int, int]]:
-    """
-    Generate (start, end) frame index pairs for non-overlapping clips.
-
-    Args:
-        start_frame: First frame index to consider (inclusive).
-        end_frame:   Last frame index to consider (exclusive).
-        clip_frames: Number of frames in each clip.
-        clip_stride: Step between consecutive clip start frames.
-
-    Returns:
-        List of (clip_start, clip_end) tuples.
-    """
-    clips = []
-    pos = start_frame
-    while pos + clip_frames <= end_frame:
-        clips.append((pos, pos + clip_frames))
-        pos += clip_stride
-    return clips
-
-
-def build_clip_list(
-    cow_id: str,
-    video_path: str,
-    start_frame: int,
-    end_frame: int,
-    clip_frames: int,
-    clip_stride: int,
-    split: str,
-    role: str = "train",        # "train" | "gallery" | "query"
+def extract_clips(
+    video_path:   str,
+    cow_id:       str,
+    split:        str,
+    clips_dir:    str,
+    clip_seconds: float = 10.0,
 ) -> List[Dict]:
     """
-    Build a list of clip descriptors for one cow's video segment.
+    Cut *video_path* into non-overlapping 10-second clips using ffmpeg.
 
-    Each descriptor is a lightweight dict — no frames are loaded here;
-    loading happens in the dataset at training/evaluation time.
+    Output path: {clips_dir}/{split}/{cow_id}/{cow_id}_{N:03d}.mp4
+    Clips are re-encoded at 256×256 / libx264 / ultrafast / crf28 (≈1–2 MB each).
+    Already-existing clips are skipped to allow re-runs without re-encoding.
 
-    Args:
-        cow_id:      Identity label (filename stem).
-        video_path:  Absolute path to the video file.
-        start_frame: First usable frame index.
-        end_frame:   Last usable frame index (exclusive).
-        clip_frames: Frames per clip.
-        clip_stride: Stride between clip start frames.
-        split:       "train" or "test".
-        role:        "train" | "gallery" | "query".
-
-    Returns:
-        List of clip descriptor dicts.
+    Returns a list of clip-info dicts (path, number, cow_id, split).
     """
-    indices = generate_clip_indices(start_frame, end_frame, clip_frames, clip_stride)
+    out_dir = Path(clips_dir) / split / cow_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fps, duration = get_video_duration(video_path)
+    n_clips = int(duration // clip_seconds)
+
+    if n_clips == 0:
+        print(f"  WARNING: {cow_id} is only {duration:.1f}s — skipping (too short).")
+        return []
+
     clips = []
-    for start, end in indices:
+    for i in range(n_clips):
+        start_s      = i * clip_seconds
+        clip_number  = i + 1
+        out_path     = out_dir / f"{cow_id}_{clip_number:03d}.mp4"
+
+        if not out_path.exists():
+            cmd = [
+                FFMPEG, "-y",
+                "-ss", str(start_s),       # fast input-seek (keyframe accurate)
+                "-i", video_path,
+                "-t", str(clip_seconds),
+                "-vf", "scale=256:256",    # resize; model will crop to 224
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "28",
+                "-an",                     # drop audio track
+                str(out_path),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(f"  WARNING: ffmpeg failed for {out_path.name}:\n"
+                      f"    {proc.stderr[-300:]}")
+                continue
+
         clips.append({
             "cow_id":      cow_id,
-            "video_path":  video_path,
-            "start_frame": start,
-            "end_frame":   end,
-            "clip_frames": clip_frames,
             "split":       split,
-            "role":        role,
+            "clip_path":   str(out_path),
+            "clip_number": clip_number,
         })
+
     return clips
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gallery / Query split for test cows
-# ─────────────────────────────────────────────────────────────────────────────
-
-def create_gallery_query_split(
-    cow_id: str,
-    video_path: str,
-    gallery_seconds: float,
-    fps: float,
-    total_frames: int,
-    clip_frames: int,
-    clip_stride: int,
-) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Split a test cow's video into gallery and query segments.
-
-    Gallery: frames [0, gallery_end)   — first gallery_seconds of video
-    Query:   frames [gallery_end, end) — strict temporal separation
-
-    The boundary is chosen so no frame appears in both gallery and query.
-
-    Args:
-        cow_id:          Cow identity.
-        video_path:      Path to video.
-        gallery_seconds: Duration (in seconds) allocated to the gallery.
-        fps:             Frames per second of the video.
-        total_frames:    Total frame count.
-        clip_frames:     Frames per clip.
-        clip_stride:     Stride between clip starts.
-
-    Returns:
-        (gallery_clips, query_clips)
-    """
-    gallery_end = int(gallery_seconds * fps)
-    # Ensure gallery_end is a multiple of clip_frames for clean clips
-    gallery_end = (gallery_end // clip_frames) * clip_frames
-    gallery_end = min(gallery_end, total_frames)
-
-    if gallery_end <= 0:
-        raise ValueError(
-            f"Cow {cow_id}: gallery_end={gallery_end} is invalid "
-            f"(fps={fps:.1f}, total_frames={total_frames})"
-        )
-
-    query_start = gallery_end          # Strictly after gallery — no overlap
-
-    gallery_clips = build_clip_list(
-        cow_id, video_path,
-        start_frame=0,
-        end_frame=gallery_end,
-        clip_frames=clip_frames,
-        clip_stride=clip_stride,
-        split="test",
-        role="gallery",
-    )
-
-    query_clips = build_clip_list(
-        cow_id, video_path,
-        start_frame=query_start,
-        end_frame=total_frames,
-        clip_frames=clip_frames,
-        clip_stride=clip_stride,
-        split="test",
-        role="query",
-    )
-
-    if not gallery_clips:
-        print(f"  WARNING: Cow {cow_id} has no gallery clips — video too short?")
-    if not query_clips:
-        print(f"  WARNING: Cow {cow_id} has no query clips — extend recording?")
-
-    return gallery_clips, query_clips
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main preparation pipeline
+# Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 def prepare_dataset(
-    video_dir: str,
-    processed_dir: str,
-    num_train_cows: int = 21,
-    gallery_seconds: float = 10.0,
-    clip_frames: int = 16,
-    clip_stride: int = 8,
-    seed: int = 42,
+    video_dir:      str  = "/home/hswts124607/cow_videos",
+    clips_dir:      str  = "/local1/cow_clips",
+    processed_dir:  str  = "./data/processed",
+    num_train_cows: int  = 15,
+    num_val_cows:   int  = 6,
+    clip_seconds:   float = 10.0,
+    seed:           int  = 42,
 ) -> Dict:
     """
-    Full preparation pipeline.
-
-    Steps:
-      1. Discover all cow videos.
-      2. Split cow IDs into train / test.
-      3. Build training clip list (all frames, all train cows).
-      4. Build gallery and query clip lists for test cows.
-      5. Assemble and save metadata JSON.
-
-    Args:
-        video_dir:       Directory with raw cow videos.
-        processed_dir:   Output directory for metadata JSON.
-        num_train_cows:  Number of cows in the training set.
-        gallery_seconds: Seconds of each test video used as gallery.
-        clip_frames:     Frames per video clip.
-        clip_stride:     Stride between clip starts.
-        seed:            Random seed for train/test split.
-
-    Returns:
-        Metadata dictionary (also saved to disk as JSON).
+    Full preparation pipeline. Safe to re-run: clips already on disk are skipped.
     """
-    processed_dir = Path(processed_dir)
-    processed_dir.mkdir(parents=True, exist_ok=True)
+    print("=" * 60)
+    print("Cow Re-ID — Data Preparation v2")
+    print("=" * 60)
 
-    # ── Step 1: discover ──────────────────────────────────────────────────────
+    # 1. Disk-space guard BEFORE creating any files
+    print("\n[1/5] Checking disk space …")
+    # Resolve mount point: /local1/cow_clips → /local1
+    mount = "/" + clips_dir.lstrip("/").split("/")[0]
+    check_disk_space(mount, min_gb=5.0)
+
+    Path(processed_dir).mkdir(parents=True, exist_ok=True)
+
+    # 2. Discover videos
+    print("\n[2/5] Discovering videos …")
     cow_videos = discover_videos(video_dir)
-    all_cow_ids = sorted(cow_videos.keys())
-    total_cows = len(all_cow_ids)
-    print(f"\nTotal cows: {total_cows}")
+    all_ids    = sorted(cow_videos.keys())
+    if len(all_ids) != 31:
+        print(f"  NOTE: expected 31 cows, found {len(all_ids)}")
 
-    # ── Step 2: split ─────────────────────────────────────────────────────────
-    train_ids, test_ids = split_cows(all_cow_ids, num_train=num_train_cows, seed=seed)
+    # 3. Split
+    print("\n[3/5] Splitting cows …")
+    train_ids, val_ids, test_ids = split_cows(
+        all_ids, num_train_cows, num_val_cows, seed
+    )
+    train_label = {cid: i for i, cid in enumerate(sorted(train_ids))}
 
-    # Assign integer class indices to TRAIN identities only.
-    # Test identities are deliberately excluded from the index
-    # because the model never classifies them — it ranks by embedding distance.
-    train_id_to_idx = {cid: i for i, cid in enumerate(sorted(train_ids))}
+    # 4. Extract clips
+    print("\n[4/5] Extracting clips (ffmpeg) …")
+    all_clips: List[Dict] = []
 
-    # ── Step 3: training clips ────────────────────────────────────────────────
-    print("\nBuilding training clip list...")
-    train_clips: List[Dict] = []
-    for cow_id in train_ids:
-        video_path = cow_videos[cow_id]
-        meta = get_video_metadata(video_path)
-        clips = build_clip_list(
-            cow_id=cow_id,
-            video_path=video_path,
-            start_frame=0,
-            end_frame=meta["total_frames"],
-            clip_frames=clip_frames,
-            clip_stride=clip_stride,
-            split="train",
-            role="train",
-        )
-        # Attach integer label for triplet sampling
-        for c in clips:
-            c["label"] = train_id_to_idx[cow_id]
-        train_clips.extend(clips)
-        print(f"  {cow_id}: {meta['duration_seconds']:.1f}s  "
-              f"→ {len(clips)} clips  (label={train_id_to_idx[cow_id]})")
+    for split_name, cow_ids in [
+        ("train", train_ids),
+        ("val",   val_ids),
+        ("test",  test_ids),
+    ]:
+        print(f"\n  [{split_name.upper()}]")
+        for cow_id in cow_ids:
+            clips = extract_clips(
+                cow_videos[cow_id], cow_id, split_name, clips_dir, clip_seconds
+            )
+            # Assign roles: train clips all get role="train";
+            # for val/test the FIRST clip is the query, rest are gallery.
+            for j, c in enumerate(clips):
+                if split_name == "train":
+                    c["role"]  = "train"
+                    c["label"] = train_label[cow_id]
+                else:
+                    c["role"]  = "query" if j == 0 else "gallery"
+                    c["label"] = None
+            all_clips.extend(clips)
+            role_str = (f"{len(clips)} train"
+                        if split_name == "train"
+                        else f"1 query + {len(clips)-1} gallery")
+            print(f"    {cow_id}: {len(clips)} clips  ({role_str})")
 
-    # ── Step 4: test gallery + query ──────────────────────────────────────────
-    print("\nBuilding gallery and query clip lists...")
-    gallery_clips: List[Dict] = []
-    query_clips:   List[Dict] = []
+    # 5. Build and save metadata
+    print("\n[5/5] Saving metadata …")
 
-    for cow_id in test_ids:
-        video_path = cow_videos[cow_id]
-        meta = get_video_metadata(video_path)
-
-        g_clips, q_clips = create_gallery_query_split(
-            cow_id=cow_id,
-            video_path=video_path,
-            gallery_seconds=gallery_seconds,
-            fps=meta["fps"],
-            total_frames=meta["total_frames"],
-            clip_frames=clip_frames,
-            clip_stride=clip_stride,
+    def _count(sp, rl=None):
+        return sum(
+            1 for c in all_clips
+            if c["split"] == sp and (rl is None or c["role"] == rl)
         )
 
-        gallery_clips.extend(g_clips)
-        query_clips.extend(q_clips)
-        print(f"  {cow_id}: {meta['duration_seconds']:.1f}s  "
-              f"→ gallery={len(g_clips)} clips, query={len(q_clips)} clips")
-
-    # ── Step 5: assemble and save ─────────────────────────────────────────────
     metadata = {
-        "version":           "1.0",
-        "video_dir":         str(Path(video_dir).resolve()),
-        "total_cows":        total_cows,
-        "num_train_cows":    len(train_ids),
-        "num_test_cows":     len(test_ids),
-        "train_cow_ids":     train_ids,
-        "test_cow_ids":      test_ids,
-        "train_id_to_idx":   train_id_to_idx,
-        "clip_frames":       clip_frames,
-        "clip_stride":       clip_stride,
-        "gallery_seconds":   gallery_seconds,
-        "splits": {
-            "train":   {"clips": train_clips,   "num_clips": len(train_clips)},
-            "gallery": {"clips": gallery_clips, "num_clips": len(gallery_clips)},
-            "query":   {"clips": query_clips,   "num_clips": len(query_clips)},
+        "version":         "2.0",
+        "video_dir":       str(Path(video_dir).resolve()),
+        "clips_dir":       str(Path(clips_dir).resolve()),
+        "seed":            seed,
+        "clip_seconds":    clip_seconds,
+        "cow_splits": {
+            "train": train_ids,
+            "val":   val_ids,
+            "test":  test_ids,
         },
+        "train_id_to_label": train_label,
+        "summary": {
+            "train": {
+                "n_cows":   len(train_ids),
+                "n_clips":  _count("train"),
+            },
+            "val": {
+                "n_cows":   len(val_ids),
+                "n_query":  _count("val",  "query"),
+                "n_gallery":_count("val",  "gallery"),
+                "n_clips":  _count("val"),
+            },
+            "test": {
+                "n_cows":   len(test_ids),
+                "n_query":  _count("test", "query"),
+                "n_gallery":_count("test", "gallery"),
+                "n_clips":  _count("test"),
+            },
+        },
+        "clips": all_clips,
     }
 
-    out_path = processed_dir / "dataset_metadata.json"
+    out_path = Path(processed_dir) / "dataset_metadata.json"
     with open(out_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"\nDataset metadata saved to {out_path}")
-    print(f"  Train clips:   {len(train_clips)}")
-    print(f"  Gallery clips: {len(gallery_clips)}")
-    print(f"  Query clips:   {len(query_clips)}")
+    s = metadata["summary"]
+    print(f"\nDataset metadata → {out_path}")
+    print(f"  Train : {s['train']['n_cows']} cows, {s['train']['n_clips']} clips")
+    print(f"  Val   : {s['val']['n_cows']} cows, "
+          f"{s['val']['n_query']} queries + {s['val']['n_gallery']} gallery")
+    print(f"  Test  : {s['test']['n_cows']} cows, "
+          f"{s['test']['n_query']} queries + {s['test']['n_gallery']} gallery")
 
     return metadata
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI entry point
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Prepare the cow re-ID dataset (split, gallery/query creation)."
-    )
-    parser.add_argument("--video_dir",       default="/data",
-                        help="Directory containing one .mp4 per cow.")
-    parser.add_argument("--processed_dir",   default="./data/processed",
-                        help="Output directory for metadata JSON.")
-    parser.add_argument("--num_train_cows",  type=int, default=21)
-    parser.add_argument("--gallery_seconds", type=float, default=10.0)
-    parser.add_argument("--clip_frames",     type=int, default=16)
-    parser.add_argument("--clip_stride",     type=int, default=8)
-    parser.add_argument("--seed",            type=int, default=42)
-    return parser.parse_args()
+def _parse_args():
+    p = argparse.ArgumentParser(description="Prepare cow re-ID dataset (v2).")
+    p.add_argument("--video_dir",      default="/home/hswts124607/cow_videos")
+    p.add_argument("--clips_dir",      default="/local1/cow_clips")
+    p.add_argument("--processed_dir",  default="./data/processed")
+    p.add_argument("--num_train_cows", type=int,   default=15)
+    p.add_argument("--num_val_cows",   type=int,   default=6)
+    p.add_argument("--clip_seconds",   type=float, default=10.0)
+    p.add_argument("--seed",           type=int,   default=42)
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    args = _parse_args()
     prepare_dataset(
-        video_dir       = args.video_dir,
-        processed_dir   = args.processed_dir,
-        num_train_cows  = args.num_train_cows,
-        gallery_seconds = args.gallery_seconds,
-        clip_frames     = args.clip_frames,
-        clip_stride     = args.clip_stride,
-        seed            = args.seed,
+        video_dir      = args.video_dir,
+        clips_dir      = args.clips_dir,
+        processed_dir  = args.processed_dir,
+        num_train_cows = args.num_train_cows,
+        num_val_cows   = args.num_val_cows,
+        clip_seconds   = args.clip_seconds,
+        seed           = args.seed,
     )

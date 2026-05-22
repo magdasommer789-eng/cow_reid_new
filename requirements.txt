@@ -26,7 +26,9 @@ Pillow==10.0.0
 # ─── Training utilities ────────────────────────────────────────────────
 tqdm==4.66.1
 tensorboard==2.14.0
-wandb==0.15.12         # optional; set use_wandb: false in config to skip
+wandb==0.15.12         # WandB tracking; set use_wandb: false in config to skip
+optuna==3.6.1          # Hyperparameter optimisation
+tabulate==0.9.0        # required by pandas .to_markdown()
 
 # ─── Config & utilities ────────────────────────────────────────────────
 pyyaml==6.0.1

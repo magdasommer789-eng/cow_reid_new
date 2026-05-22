@@ -1,35 +1,27 @@
 """
-Main Training Script — Video-Based Cow Re-Identification
-=========================================================
+Main Training Script v2 — Video-Based Cow Re-Identification
+============================================================
 
-Entry point that orchestrates:
-  1. Dataset preparation (if not already done)
-  2. Model creation (C3D / X3D / Video Swin / ViViT)
-  3. Metric-learning training with Batch Hard Triplet Loss
-  4. Evaluation on gallery/query test set (CMC + mAP)
-  5. Results table across all models
+Entry point for:
+  --prepare_data   : Run data preparation (clip extraction).
+  --hpo            : Hyperparameter optimisation with Optuna + WandB.
+  --model / --all  : Train a single model (or all) with optional best hparams.
+  --eval_only      : Skip training, evaluate from checkpoint.
+  --final          : Train on combined train+val with best hparams.
 
-Usage examples:
-  # Single model
-  python -m scripts.train --model c3d
-  python -m scripts.train --model x3d
-  python -m scripts.train --model swin
-  python -m scripts.train --model vivit
+Typical workflow:
+  # Step 1 — extract clips
+  python -m scripts.train --prepare_data
 
-  # All models sequentially
-  python -m scripts.train --all
+  # Step 2 — HPO (finds best hparams per model)
+  python -m scripts.train --hpo --all
 
-  # Skip training, only evaluate from existing checkpoint
-  python -m scripts.train --model c3d --eval_only \
-      --checkpoint checkpoints/c3d_best.pt
-
-  # Custom config
-  python -m scripts.train --model swin --config configs/config.yaml
+  # Step 3 — final training on train+val, then test evaluation
+  python -m scripts.train --final --all
 """
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -38,245 +30,169 @@ import yaml
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Argument parsing
+# Utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train and evaluate video-based cow re-ID models."
-    )
-    parser.add_argument(
-        "--model",
-        choices=["c3d", "x3d", "swin", "vivit"],
-        help="Which model to train/evaluate.",
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help="Train and evaluate all models sequentially.",
-    )
-    parser.add_argument(
-        "--config",
-        default="./configs/config.yaml",
-        help="Path to YAML config file.",
-    )
-    parser.add_argument(
-        "--eval_only",
-        action="store_true",
-        help="Skip training, only run evaluation.",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        default=None,
-        help="Checkpoint path for --eval_only mode.",
-    )
-    parser.add_argument(
-        "--prepare_data",
-        action="store_true",
-        help="Force re-run of data preparation even if metadata exists.",
-    )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help="Override device (cuda / cpu).",
-    )
-    return parser.parse_args()
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config loader
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
-    return cfg
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data preparation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ensure_data_prepared(cfg: dict, force: bool = False) -> dict:
-    """
-    Run data_preparation.prepare_dataset() if metadata JSON doesn't exist yet.
-
-    Args:
-        cfg:   Config dict.
-        force: If True, re-run preparation even if metadata already exists.
-
-    Returns:
-        Loaded metadata dict.
-    """
-    from .data_preparation import prepare_dataset
-
+def load_metadata(cfg: dict) -> dict:
     meta_path = Path(cfg["data"]["processed_dir"]) / "dataset_metadata.json"
-
-    if meta_path.exists() and not force:
-        print(f"Dataset metadata found at {meta_path} — skipping preparation.")
-        with open(meta_path) as f:
-            return json.load(f)
-
-    print("Running data preparation...")
-    metadata = prepare_dataset(
-        video_dir       = cfg["data"]["video_dir"],
-        processed_dir   = cfg["data"]["processed_dir"],
-        num_train_cows  = cfg["data"]["num_train_cows"],
-        gallery_seconds = cfg["data"]["gallery_seconds"],
-        clip_frames     = cfg["data"]["clip_frames"],
-        clip_stride     = cfg["data"]["clip_stride"],
-        seed            = cfg["data"]["random_seed"],
-    )
-    return metadata
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"Metadata not found at {meta_path}. Run --prepare_data first."
+        )
+    with open(meta_path) as f:
+        return json.load(f)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model factory (dispatches to CNN or Transformer factory)
-# ─────────────────────────────────────────────────────────────────────────────
+def load_best_hparams(model_name: str, cfg: dict) -> dict:
+    """Load saved best hparams or return empty dict (use config defaults)."""
+    path = Path(cfg["logging"]["results_dir"]) / f"{model_name}_best_hparams.json"
+    if path.exists():
+        with open(path) as f:
+            hp = json.load(f)
+        # Remove summary key that isn't a hyperparameter
+        hp.pop("best_val_rank1", None)
+        print(f"  Loaded best hparams from {path}")
+        return hp
+    print(f"  No saved hparams for {model_name} — using config defaults.")
+    return {}
 
-def build_model(model_name: str, cfg: dict, device: str):
-    """
-    Instantiate the requested embedding model with settings from config.
 
-    Args:
-        model_name: "c3d" | "x3d" | "swin" | "vivit"
-        cfg:        Config dict.
-        device:     "cuda" or "cpu".
+def build_model(model_name: str, cfg: dict, hparams: dict, device: str):
+    mc  = cfg["model"]
+    edim = hparams.get("embedding_dim", mc["embedding_dim"])
+    dr   = hparams.get("dropout_rate",  mc[model_name]["dropout_rate"])
 
-    Returns:
-        torch.nn.Module
-    """
-    mc = cfg["model"]
-    embed_dim = mc["embedding_dim"]
-
-    if model_name == "c3d":
+    if model_name in ("c3d", "x3d"):
         from .models_cnn import create_cnn_model
         return create_cnn_model(
-            model_name      = "c3d",
-            embedding_dim   = embed_dim,
-            pretrained      = mc["c3d"]["pretrained"],
-            freeze_backbone = mc["c3d"]["freeze_backbone"],
-            dropout_rate    = mc["c3d"]["dropout_rate"],
+            model_name      = model_name,
+            embedding_dim   = edim,
+            pretrained      = mc[model_name]["pretrained"],
+            freeze_backbone = mc[model_name]["freeze_backbone"],
+            dropout_rate    = dr,
             device          = device,
+            model_size      = mc["x3d"]["model_size"] if model_name == "x3d" else "m",
         )
-
-    if model_name == "x3d":
-        from .models_cnn import create_cnn_model
-        return create_cnn_model(
-            model_name      = "x3d",
-            embedding_dim   = embed_dim,
-            pretrained      = mc["x3d"]["pretrained"],
-            freeze_backbone = mc["x3d"]["freeze_backbone"],
-            dropout_rate    = mc["x3d"]["dropout_rate"],
-            device          = device,
-            model_size      = mc["x3d"]["model_size"],
-        )
-
     if model_name == "swin":
         from .models_transformer import create_transformer_model
         return create_transformer_model(
             model_name      = "swin",
-            embedding_dim   = embed_dim,
+            embedding_dim   = edim,
             pretrained      = mc["swin"]["pretrained"],
             freeze_backbone = mc["swin"]["freeze_backbone"],
-            dropout_rate    = mc["swin"]["dropout_rate"],
+            dropout_rate    = dr,
             device          = device,
             swin_variant    = mc["swin"]["model_name"],
         )
-
     if model_name == "vivit":
         from .models_transformer import create_transformer_model
         return create_transformer_model(
             model_name      = "vivit",
-            embedding_dim   = embed_dim,
+            embedding_dim   = edim,
             pretrained      = mc["vivit"]["pretrained"],
             freeze_backbone = mc["vivit"]["freeze_backbone"],
-            dropout_rate    = mc["vivit"]["dropout_rate"],
+            dropout_rate    = dr,
             device          = device,
-            num_frames      = cfg["data"]["clip_frames"],
+            num_frames      = cfg["data"].get("clip_frames", 16),
             tubelet_size    = mc["vivit"]["tubelet_size"],
         )
-
     raise ValueError(f"Unknown model: {model_name}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Single-model train + evaluate
+# Train one model (train split only, val for evaluation)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_model(
+def train_model(
     model_name: str,
     cfg:        dict,
     metadata:   dict,
     device:     str,
+    hparams:    dict,
     eval_only:  bool = False,
     checkpoint: str  = None,
 ) -> dict:
-    """
-    Full pipeline for one model: (optionally train) then evaluate.
+    from .dataset   import build_train_dataset, build_eval_dataset
+    from .trainer   import build_trainer
+    from .evaluate  import evaluate_model
 
-    Args:
-        model_name:  Which model to run.
-        cfg:         Config dict.
-        metadata:    Dataset metadata from data_preparation.
-        device:      Compute device.
-        eval_only:   If True, skip training and load `checkpoint`.
-        checkpoint:  Path to .pt file for eval_only mode.
+    model = build_model(model_name, cfg, hparams, device)
 
-    Returns:
-        Evaluation results dict.
-    """
-    from .dataset import build_train_dataset, build_eval_dataset
-    from .evaluate import evaluate_model
-
-    img_size = cfg["data"]["target_size"][0]
-
-    # ── Build model ───────────────────────────────────────────────────────────
-    model = build_model(model_name, cfg, device)
-
-    # ── Train ─────────────────────────────────────────────────────────────────
     if not eval_only:
-        from .trainer import build_trainer
+        train_ds = build_train_dataset(metadata, temporal_jitter=True)
+        val_ds   = build_eval_dataset(metadata, split="val")
 
-        train_ds = build_train_dataset(
-            metadata        = metadata,
-            img_size        = img_size,
-            temporal_jitter = cfg["augmentation"]["train"]["temporal_jitter"],
+        wandb_run = None
+        if cfg["logging"].get("use_wandb", False):
+            import wandb
+            wandb_run = wandb.init(
+                project = cfg["logging"].get("wandb_project", "cow-reid"),
+                entity  = cfg["logging"].get("wandb_entity", None),
+                group   = "hpo_train",
+                name    = f"train_{model_name}",
+                config  = {**hparams, "model": model_name, "stage": "train"},
+                reinit  = "finish_previous",
+            )
+
+        trainer = build_trainer(
+            model      = model,
+            train_ds   = train_ds,
+            val_ds     = val_ds,
+            cfg        = cfg,
+            model_name = model_name,
+            hparams    = hparams,
+            wandb_run  = wandb_run,
         )
-
-        trainer = build_trainer(model, train_ds, cfg, model_name)
         trainer.train()
 
-        # After training, load the best checkpoint for evaluation
+        if wandb_run is not None:
+            wandb_run.finish()
+
         best_ckpt = Path(cfg["logging"]["checkpoint_dir"]) / f"{model_name}_best.pt"
         if best_ckpt.exists():
             ckpt = torch.load(best_ckpt, map_location=device)
             model.load_state_dict(ckpt["model_state"])
-            print(f"Loaded best checkpoint: {best_ckpt}")
-
+            print(f"  Loaded best checkpoint (epoch {ckpt['epoch']+1})")
     else:
-        # Eval-only: load the provided checkpoint
         if checkpoint is None:
             raise ValueError("--eval_only requires --checkpoint <path>")
         ckpt = torch.load(checkpoint, map_location=device)
         model.load_state_dict(ckpt["model_state"])
-        print(f"Loaded checkpoint: {checkpoint}")
 
-    # ── Evaluate ──────────────────────────────────────────────────────────────
-    eval_ds = build_eval_dataset(metadata, img_size=img_size)
+    # Evaluate on TEST set (do NOT look at test before final training)
+    print(f"\n  NOTE: Use --final for final training + test evaluation.")
+    return {}
 
-    results = evaluate_model(
-        model        = model,
-        eval_dataset = eval_ds,
-        model_name   = model_name,
-        device       = device,
-        batch_size   = cfg["training"]["batch_size"],
-        cmc_ranks    = cfg["evaluation"]["cmc_ranks"],
-        results_dir  = cfg["logging"]["results_dir"],
-        verbose      = True,
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_args():
+    p = argparse.ArgumentParser(
+        description="Cow re-ID training pipeline v2."
     )
+    p.add_argument("--model",    choices=["c3d", "x3d", "swin", "vivit"])
+    p.add_argument("--all",      action="store_true",
+                   help="Run for all enabled models.")
+    p.add_argument("--config",   default="./configs/config.yaml")
+    p.add_argument("--device",   default=None)
 
-    return results
+    p.add_argument("--prepare_data", action="store_true",
+                   help="Run data preparation (extract clips).")
+    p.add_argument("--hpo",      action="store_true",
+                   help="Run Optuna HPO on the val set.")
+    p.add_argument("--final",    action="store_true",
+                   help="Final training on train+val + test evaluation.")
+    p.add_argument("--eval_only",action="store_true",
+                   help="Skip training, evaluate from checkpoint.")
+    p.add_argument("--checkpoint",default=None)
+    return p.parse_args()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,68 +200,77 @@ def run_model(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
+    args = _parse_args()
     cfg  = load_config(args.config)
 
-    # Device override
-    if args.device:
-        cfg["training"]["device"] = args.device
-    device = cfg["training"]["device"]
+    device = args.device or cfg["training"]["device"]
     if device == "cuda" and not torch.cuda.is_available():
-        print("WARNING: CUDA not available — falling back to CPU.")
+        print("WARNING: CUDA not available — using CPU.")
         device = "cpu"
-        cfg["training"]["device"] = "cpu"
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
 
-    # Data preparation
-    metadata = ensure_data_prepared(cfg, force=args.prepare_data)
+    # ── Data preparation ──────────────────────────────────────────────────────
+    if args.prepare_data:
+        from .data_preparation import prepare_dataset
+        prepare_dataset(
+            video_dir      = cfg["data"]["video_dir"],
+            clips_dir      = cfg["data"]["clips_dir"],
+            processed_dir  = cfg["data"]["processed_dir"],
+            num_train_cows = cfg["data"]["num_train_cows"],
+            num_val_cows   = cfg["data"]["num_val_cows"],
+            clip_seconds   = cfg["data"]["clip_seconds"],
+            seed           = cfg["data"]["random_seed"],
+        )
+        return
+
+    metadata = load_metadata(cfg)
 
     # Determine which models to run
     if args.all:
-        exp_cfg   = cfg["experiment"]["models_to_run"]
-        to_run    = [m for m, enabled in exp_cfg.items() if enabled]
+        to_run = [m for m, on in cfg["experiment"]["models_to_run"].items() if on]
     elif args.model:
-        to_run    = [args.model]
+        to_run = [args.model]
     else:
-        print("ERROR: specify --model <name> or --all")
+        print("Specify --model <name> or --all.  See --help.")
         sys.exit(1)
 
-    print(f"\nModels to run: {to_run}")
+    # ── HPO ───────────────────────────────────────────────────────────────────
+    if args.hpo:
+        from .hpo import run_hpo
+        for model_name in to_run:
+            run_hpo(model_name, metadata, cfg, device)
+        return
 
-    # Run each model
-    all_results = []
+    # ── Final training on train+val then test eval ────────────────────────────
+    if args.final:
+        from .train_final import run_final
+        all_results = []
+        for model_name in to_run:
+            hparams = load_best_hparams(model_name, cfg)
+            result  = run_final(model_name, metadata, cfg, device, hparams)
+            all_results.append(result)
+        if len(all_results) > 1:
+            from .evaluate import build_results_table
+            build_results_table(
+                all_results = all_results,
+                results_dir = cfg["logging"]["results_dir"],
+                cmc_ranks   = cfg["evaluation"]["cmc_ranks"],
+            )
+        return
+
+    # ── Train on train split (HPO training or standalone) ────────────────────
     for model_name in to_run:
-        print(f"\n{'#'*60}")
-        print(f"# MODEL: {model_name.upper()}")
-        print(f"{'#'*60}")
-
-        results = run_model(
+        hparams = load_best_hparams(model_name, cfg)
+        print(f"\n{'#'*60}\n# MODEL: {model_name.upper()}\n{'#'*60}")
+        train_model(
             model_name = model_name,
             cfg        = cfg,
             metadata   = metadata,
             device     = device,
+            hparams    = hparams,
             eval_only  = args.eval_only,
             checkpoint = args.checkpoint,
         )
-        all_results.append(results)
-
-    # ── Final results table ───────────────────────────────────────────────────
-    if len(all_results) > 1:
-        from .evaluate import build_results_table
-        build_results_table(
-            all_results = all_results,
-            results_dir = cfg["logging"]["results_dir"],
-            cmc_ranks   = cfg["evaluation"]["cmc_ranks"],
-        )
-    elif len(all_results) == 1:
-        r = all_results[0]
-        print(f"\nFinal result for {r['model_name'].upper()}:")
-        print(f"  mAP={r['mAP']:.4f}  "
-              f"Rank-1={r.get('rank1', 0):.4f}  "
-              f"Rank-5={r.get('rank5', 0):.4f}  "
-              f"Rank-10={r.get('rank10', 0):.4f}")
-
-    print("\nDone.")
 
 
 if __name__ == "__main__":

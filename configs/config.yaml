@@ -1,142 +1,115 @@
-# Cow Re-Identification (Video-Based): Configuration File
-# =========================================================
-# Educational Project — Metric Learning for Animal Re-ID
-#
-# This project treats re-identification as an EMBEDDING problem:
-# - Models learn a distance metric, not a classifier
-# - At test time, unseen cows are ranked by embedding similarity
-# - No cow identity label is used during inference
-# =========================================================
+# Cow Re-Identification (Video-Based): Configuration v2
+# ======================================================
+# Split: 15 train / 6 val / 10 test cows
+# Clips: physical 10-second MP4 files on /local1 (6.6 TB free)
+# Val & Test use the same re-ID protocol: first clip = query, rest = gallery
 
-# ==================== DATA CONFIGURATION ====================
 data:
-  video_dir: "/home/hswts124607/cow_videos"               # Root directory containing cow videos
-  processed_dir: "./data/processed"  # Where extracted clips/metadata are saved
+  video_dir:     "/home/hswts124607/cow_videos"
+  clips_dir:     "/home/hswts124607/cow_clips" # physical 10s clips (~400 MB total)
+  processed_dir: "./data/processed"
 
-  # Train/Test split — split by cow identity (open-set re-ID)
-  # Training cows and test cows NEVER overlap
-  num_train_cows: 21
-  num_test_cows: 10
-  random_seed: 42                  # Reproducibility seed for the split
+  num_train_cows: 15
+  num_val_cows:    6
+  # test = remaining cows (31 - 15 - 6 = 10)
+  random_seed: 42
 
-  # Gallery/Query split for test cows
-  # Gallery: first N seconds of each test cow video → 1 embedding per cow
-  # Query:   remaining video (strictly non-overlapping with gallery)
-  gallery_seconds: 10              # How many seconds form the gallery clip
+  clip_seconds: 10.0          # each clip is exactly this many seconds
+  clip_frames:  16            # frames uniformly sampled per clip for the model
+  target_size:  [224, 224]
 
-  # Video clip parameters for the model input
-  # All four models accept a fixed-length clip of T frames at spatial size H×W
-  clip_frames: 16                  # Number of frames per clip (temporal depth T)
-  clip_stride: 8                   # Frame stride between clips during extraction
-  target_size: [224, 224]          # Spatial resize: [H, W]
-  fps: 25                          # Assumed frame rate (used for time → frame conversion)
-
-  # During training: how many clips to sample per cow per epoch
-  clips_per_cow_train: 20
-
-# ==================== MODEL CONFIGURATION ====================
-# All models output a fixed-dimension L2-normalised embedding vector.
-# The embedding head is shared across architectures; only the backbone differs.
-
+# ── Models ──────────────────────────────────────────────────────────────────
 model:
-  embedding_dim: 512               # Final embedding dimension (all models)
+  embedding_dim: 512
 
-  # ---- C3D ----
-  # Classic 3D-CNN from Tran et al. 2015. Pre-trained on Sports-1M.
-  # We load weights and replace the final FC with an embedding head.
   c3d:
-    pretrained: true               # Load Sports-1M → fine-tune
+    pretrained:      true     # tries Sports-1M; falls back to random init
     freeze_backbone: false
-    dropout_rate: 0.5
+    dropout_rate:    0.5
 
-  # ---- X3D ----
-  # Efficient 3D-CNN from Feichtenhofer 2020 (Facebook Research).
-  # Available in pytorchvideo with Kinetics-400 weights (ImageNet init).
   x3d:
-    model_size: "M"                # xs | s | M | l  — M is a good balance
-    pretrained: true
+    model_size:      "M"      # xs | s | M | l
+    pretrained:      true     # Kinetics-400 (ImageNet-pretrained backbone)
     freeze_backbone: false
-    dropout_rate: 0.5
+    dropout_rate:    0.5
 
-  # ---- Video Swin Transformer ----
-  # Hierarchical Swin-Transformer adapted for video by Liu et al. 2021.
-  # Loaded via timm / pytorchvideo with ImageNet-22K init.
   swin:
-    model_name: "swin3d_t"         # torchvision swin3d_t | swin3d_s | swin3d_b
-    pretrained: true
+    model_name:      "swin3d_t"   # swin3d_t | swin3d_s | swin3d_b
+    pretrained:      true         # Kinetics-400 (ImageNet-22K backbone)
     freeze_backbone: false
-    dropout_rate: 0.1
+    dropout_rate:    0.1
 
-  # ---- ViViT ----
-  # Video Vision Transformer from Arnab et al. 2021 (Google DeepMind).
-  # Tubelet embedding: patches extracted across space AND time.
-  # Loaded via timm with ImageNet-21K init on vit_base_patch16_224.
   vivit:
-    image_model: "vit_base_patch16_224"  # timm base model for weight init
-    num_frames: 16                  # Must match data.clip_frames
-    tubelet_size: 2                 # Temporal patch size
-    pretrained: true
+    image_model:     "vit_base_patch16_224"  # timm base for weight inflation
+    num_frames:      16
+    tubelet_size:    2
+    pretrained:      true         # ImageNet-21K ViT-B/16 inflated to video
     freeze_backbone: false
-    dropout_rate: 0.1
+    dropout_rate:    0.1
 
-# ==================== TRAINING CONFIGURATION ====================
+# ── Training defaults (overridden by HPO best params for final run) ──────────
 training:
-  batch_size: 8                    # Lower than image models due to video memory cost
-  num_epochs: 8
-  learning_rate: 0.0001
-  weight_decay: 0.0001
+  batch_size:               8
+  num_epochs:               50
+  learning_rate:            0.0001
+  weight_decay:             0.0001
+  optimizer:                "adamw"
+  scheduler:                "cosine"
+  warmup_epochs:            3
+  loss:                     "triplet"
+  triplet_margin:           0.3
+  P:                        4       # identities per batch
+  K:                        2       # clips per identity  (batch_size = P*K)
+  batches_per_epoch:        30      # gradient steps per epoch (repeat-samples for small data)
+  early_stopping_patience:  5       # epochs without val improvement before stopping
+  device:                   "cuda"
 
-  optimizer: "adam"                # adam | sgd | adamw
-  scheduler: "cosine"              # cosine | step
-  warmup_epochs: 5
+# ── Hyperparameter optimisation (Optuna) ─────────────────────────────────────
+hpo:
+  n_trials:               30
+  max_epochs_per_trial:   20
+  pruner_startup_trials:  5
+  pruner_warmup_steps:    3
+  # Search space
+  lr_min:               0.00001
+  lr_max:               0.001
+  wd_min:               0.00001
+  wd_max:               0.001
+  dropout_choices:      [0.1, 0.2, 0.3, 0.5]
+  margin_min:           0.1
+  margin_max:           0.5
+  P_choices:            [4, 8]
+  K_choices:            [2, 4]
+  embed_dim_choices:    [256, 512]
 
-  # Loss function: Batch Hard Triplet Loss
-  # For each anchor in a batch, mines the hardest positive and hardest negative
-  loss: "triplet"
-  triplet_margin: 0.3              # Margin α in: d(a,p) + α < d(a,n)
-
-  # Sampling strategy: P cows × K clips per mini-batch
-  # Guarantees each mini-batch contains multiple clips per identity
-  P: 4                             # Number of identities per batch
-  K: 2                             # Number of clips per identity (batch_size = P*K)
-
-  early_stopping_patience: 3
-  device: "cuda"
-
-# ==================== AUGMENTATION CONFIGURATION ====================
+# ── Augmentation ──────────────────────────────────────────────────────────────
 augmentation:
   train:
-    resize: [224, 224]
-    horizontal_flip: 0.5
-    color_jitter: 0.3              # brightness/contrast/saturation jitter
-    random_rotation: 10
-    temporal_jitter: true          # Randomly shift the clip start frame
-    random_crop: true              # Random spatial crop before resize
+    horizontal_flip:  0.5
+    color_jitter:     0.3   # brightness/contrast/saturation
+    random_rotation:  10
+    temporal_jitter:  true  # random start frame within clip
+  eval:
+    center_crop: true       # deterministic, no augmentation
 
-  test:
-    resize: [224, 224]             # No augmentation at test time (deterministic)
-
-# ==================== EVALUATION CONFIGURATION ====================
+# ── Evaluation ────────────────────────────────────────────────────────────────
 evaluation:
-  # For each gallery clip (10s), rank ALL query clips by embedding distance
-  # Report CMC and mAP across all queries
-  metrics: ["cmc", "map"]
-  cmc_ranks: [1, 5, 10]           # Rank-k values to report
+  metrics:    ["cmc", "map"]
+  cmc_ranks:  [1, 5, 10]
 
-# ==================== LOGGING & CHECKPOINTS ====================
+# ── Logging & Checkpoints ─────────────────────────────────────────────────────
 logging:
-  log_dir: "./logs"
+  log_dir:        "./logs"
   checkpoint_dir: "./checkpoints"
-  results_dir: "./results"
-  save_interval: 999                 # Save checkpoint every N epochs
-  use_tensorboard: true
-  use_wandb: false
+  results_dir:    "./results"
+  use_wandb:      true
+  wandb_project:  "cow-reid"
+  wandb_entity:   "helix_sommer-weihenstephan-triesdorf-university-of-appli"
 
-# ==================== EXPERIMENT CONFIGURATION ====================
+# ── Which models to run ───────────────────────────────────────────────────────
 experiment:
-  # Which models to train and evaluate (set false to skip)
   models_to_run:
-    c3d: true
-    x3d: true
-    swin: true
+    c3d:   true
+    x3d:   true
+    swin:  true
     vivit: true
